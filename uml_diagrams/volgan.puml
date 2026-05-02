@@ -1,0 +1,109 @@
+@startuml volgan
+title VolGAN — Vuletic et al. (2023)\nConditional GAN for IV Surface Increments
+
+skinparam defaultFontName Monospaced
+skinparam defaultFontSize 11
+skinparam roundCorner 10
+
+' =====================================================================
+' Inputs
+' =====================================================================
+package "Per-day Inputs" #LightYellow {
+  card "noise z : (B, noise_dim=16)\n  ~ N(0, I)" as NOISE
+  card "condition c : (B, cond_dim)\n  [ log_rtn_t-1, log_rtn_t-2,\n    realised_vol_t-1,\n    log_iv_t-1 (Ngrid points) ]\n  Ngrid = lk * lt = 10 * 8 = 80" as COND
+  card "real target y : (B, 1 + Ngrid)\n  [ log_rtn_t, log_iv_inc_t ]" as REAL
+}
+
+' =====================================================================
+' Generator
+' =====================================================================
+package "Generator G(z, c)" #LightCyan {
+  rectangle "concat(z, c) -> (B, noise_dim + cond_dim)" as GIN
+  rectangle "Linear(in -> hidden=8)\nSoftplus" as G1
+  rectangle "Linear(hidden -> 2*hidden=16)\nSoftplus" as G2
+  rectangle "Linear(2*hidden -> output_dim = 1 + Ngrid)\n(no activation on final layer)" as G3
+  card "fake : (B, 1 + Ngrid)\n  [ fake_log_rtn, fake_log_iv_inc ]" as FAKE
+}
+
+NOISE --> GIN
+COND  --> GIN
+GIN --> G1
+G1  --> G2
+G2  --> G3
+G3  --> FAKE
+
+' =====================================================================
+' Discriminator
+' =====================================================================
+package "Discriminator D(c, y)" #LightPink {
+  rectangle "concat(c, y) -> (B, cond_dim + 1 + Ngrid)" as DIN
+  rectangle "Linear(in_dim -> hidden=8)\nSoftplus" as D1
+  rectangle "Linear(hidden -> 1)\nSigmoid" as D2
+  card "p_real : (B, 1)" as POUT
+}
+
+REAL --> DIN : "real_and_cond"
+FAKE --> DIN : "fake_and_cond\n(with condition)"
+DIN --> D1
+D1  --> D2
+D2  --> POUT
+
+' =====================================================================
+' Reconstructed IV surface (used for penalties)
+' =====================================================================
+package "Surface Reconstruction" #LightGreen {
+  rectangle "fake_surface = exp( fake_log_iv_inc + log_iv_t-1 )\n  (B, Ngrid)\nNgrid reshaped on a (lt=8) x (lk=10) (m, tau) grid" as RECON
+}
+
+FAKE --> RECON
+COND --> RECON : "log_iv_t-1\n(slice of c)"
+
+' =====================================================================
+' Smoothness / arbitrage penalties
+' =====================================================================
+package "Penalty Operators (precomputed)" #Wheat {
+  card "matrix_t  ((Ngrid, Ngrid)):\n  finite-diff in tau direction\nt_seq scaling: 1/(tau_{i+1}-tau_i)^2\n=> t_penalty = mean_b  ( tsq * (matrix_t @ surf_b)^2 )" as PT
+  card "matrix_m  ((Ngrid-lk, Ngrid)):\n  finite-diff in moneyness direction\nm_seq scaling: 1/(m_{i+1}-m_i)^2\n=> m_penalty = mean_b  ( m_seq * (matrix_m @ surf_b)^2 )" as PM
+  card "Arb-free penalties (mP_t, mP_k, mPb_K) precomputed via\n  penalty_mutau_tensor(m, tau*365) — used for evaluation /\n  reweighting (alpha,beta search)." as ARB
+}
+
+RECON --> PM
+RECON --> PT
+
+' =====================================================================
+' Losses + Optimisers
+' =====================================================================
+package "Adversarial Training" #Wheat {
+  rectangle "BCE criterion = nn.BCELoss()" as BCE
+
+  rectangle "Discriminator step (RMSprop, lr=lrd=1e-4):\n  L_D = 0.5 * ( BCE(D(real), 1) + BCE(D(fake.detach()), 0) )" as DSTEP
+
+  rectangle "Generator step (RMSprop, lr=lrg=1e-4):\n  L_BCE     = BCE(D(fake), 1)\n  L_smooth  = alpha * m_penalty + beta * t_penalty\n  L_G       = L_BCE + L_smooth" as GSTEP
+
+  rectangle "Phase 1: GradientMatching (n_grad=100 epochs)\n  Backprop each penalty alone, record\n  ||grad||_2 over G params,\n  estimate scaling weights:\n    alpha = mean( ||grad_BCE|| / ||grad_m|| )\n    beta  = mean( ||grad_BCE|| / ||grad_t|| )\n  (returns alpha, beta)" as GRADM
+
+  rectangle "Phase 2: TrainLoopNoVal (n_epochs=1000)\n  Use (alpha, beta) from phase 1.\n  batch_size = 100,  noise_dim = 16,  hidden_dim = 8\n  alternating G / D updates per batch." as MAIN
+}
+
+POUT --> BCE
+BCE  --> DSTEP
+BCE  --> GSTEP
+PM   --> GSTEP : "alpha-weighted"
+PT   --> GSTEP : "beta-weighted"
+DSTEP --> MAIN
+GSTEP --> GRADM
+GRADM --> MAIN
+
+note bottom
+  Activations:
+    G: Softplus, Softplus, (linear out)        (note: self.activation3=Sigmoid is unused in forward)
+    D: Softplus, Sigmoid
+  Targets at time t:
+    y[:,0]   = log return r_t  (z-scored)
+    y[:,1:]  = log-IV increments delta log(IV) on the (m, tau) grid
+  Defaults from VolGAN(...):
+    noise_dim=16, hidden_dim=8, n_epochs=1000, n_grad=100,
+    lrg=lrd=1e-4, batch_size=100, RMSprop optimisers.
+end note
+
+@enduml

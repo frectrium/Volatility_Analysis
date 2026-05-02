@@ -1,0 +1,77 @@
+@startuml pipeline_D_ssvi
+title Pipeline D — SSVI (Surface SVI)\nGatheral & Jacquier (2014) — Power-Law phi, gamma=0.5
+
+skinparam defaultFontName Monospaced
+skinparam defaultFontSize 11
+skinparam roundCorner 10
+
+' =====================================================================
+' Inputs (per day)
+' =====================================================================
+package "Inputs (per day)" #LightYellow {
+  card "k = log_moneyness  (N,)\nt = tau (years)       (N,)\nsigma_obs              (N,)" as IN
+}
+
+' =====================================================================
+' Parameters
+' =====================================================================
+package "Free Parameters (5 scalars)" #LightCyan {
+  card "(a, b, c, eta, rho)\nbounds:\n  a   in [1e-5, 10]\n  b   in [1e-5, 10]\n  c   in [1e-5, 2]\n  eta in [1e-5, 1e2]\n  rho in (-1, 1)" as PARAM
+}
+
+' =====================================================================
+' Math data flow
+' =====================================================================
+package "SSVI Surface  w(k, t; param)" #LightPink {
+  rectangle "Term-structure of ATM total variance:\n  theta(t) = a + b * t^c" as THETA
+  rectangle "Power-law phi (gamma = 0.5):\n  phi(theta) = eta / sqrt(theta)" as PHI
+  rectangle "SSVI total variance:\n  inner = (phi*k + rho)^2 + (1 - rho^2)\n  w(k,t) = (theta/2) * ( 1 + rho*phi*k + sqrt(inner) )" as W
+  rectangle "Implied vol:\n  sigma_SSVI(k,t) = sqrt( w / t )" as SIG
+}
+
+PARAM --> THETA
+THETA --> PHI
+PHI   --> W
+PARAM --> W   : "rho"
+THETA --> W
+W --> SIG
+
+' =====================================================================
+' Calibration objective
+' =====================================================================
+package "Calibration  (per-day)" #LightGreen {
+  rectangle "ATM-weighted MSE in IV space:\n  w_atm(k) = 1 + (atm_weight-1) * exp( -(k^2)/0.05^2 )\n  atm_weight = 3.0\n  J(p) = mean( w_atm(k) * (sigma_SSVI(k,t;p) - sigma_obs)^2 )" as OBJ
+  rectangle "Optimizer: scipy.optimize.minimize\n  method = L-BFGS-B  (bounded)\n  init   = (1e-3, 0.04, 1.0, 0.5, -0.40)\n  multi-restart: n_restarts=10\n    extra starts ~ U(...) per param\nKeep arg-min over restarts." as OPT
+  rectangle "Diagnostics:\n  MAE, RMSE in IV (vol points), n_quotes" as DIAG
+}
+
+IN  --> OBJ
+SIG --> OBJ
+OBJ --> OPT
+OPT --> PARAM : "fitted (a*,b*,c*,eta*,rho*)"
+OPT --> DIAG
+
+' =====================================================================
+' Anchor materialisation (downstream)
+' =====================================================================
+package "Anchor Materialisation" #Wheat {
+  rectangle "For each (ttm_days, target_delta):\n  tau = ttm/365\n  F   = forward_curve_fn(tau)  (else 1.0)\n  if delta == 0:  k_opt = 0  (ATM)\n  else: solve BS_delta(k; sigma_SSVI(k,tau)) == target_delta\n        via brentq on k in [-3, 2]\n        (grid scan to bracket sign change, fallback nearest)\n  sigma_anchor = sigma_SSVI(k_opt, tau)" as ANCH
+  card "anchors : (N_anchor, 4)\n(k, tau, sigma, sigma)" as OUT
+}
+
+PARAM --> ANCH
+SIG   --> ANCH
+ANCH --> OUT
+
+' =====================================================================
+' Notes
+' =====================================================================
+note bottom
+  No neural network: 5 parameters fit per day by L-BFGS-B with 10 restarts.
+  Torch-broadcasted variant (ssvi_iv_torch) used to plug SSVI into
+  residual-over-SSVI hybrids and arb-free aux-loss grids elsewhere.
+  Reference: Gatheral & Jacquier (2014) "Arbitrage-free SVI volatility surfaces",
+  Quant Finance 14(1):59-71.
+end note
+
+@enduml

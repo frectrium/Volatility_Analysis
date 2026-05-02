@@ -1,0 +1,97 @@
+@startuml pipeline_B_hyperiv
+title Pipeline B — HyperIV (Yang et al., ICML 2025)\nSet-Embedding Hypernetwork -> 337-param IV MLP
+
+skinparam defaultFontName Monospaced
+skinparam defaultFontSize 11
+skinparam roundCorner 10
+
+' =====================================================================
+' Inputs
+' =====================================================================
+package "Inputs (per day)" #LightYellow {
+  card "Z : (B, M=9, 3)\nReference contracts\n(k_i, t_i, sigma_i)" as Z
+  card "(k,t) query : (B, N, 2)" as KT
+}
+
+note right of Z
+  k = log_moneyness, t = tau (years), sigma = IV
+  Permutation invariant set
+  (no positional embeddings).
+end note
+
+' =====================================================================
+' Hypernetwork  g_theta(Z) -> omega
+' =====================================================================
+package "SetEmbeddingNetwork  g_theta" #LightCyan {
+  rectangle "fc1 : Linear(3 -> d=128)" as FC1
+  rectangle "TransformerEncoderLayer x num_layers=2\n  d_model=128, nhead=2,\n  dim_feedforward=128,\n  dropout=0, activation=ReLU,\n  batch_first=True\n(post-LN, default)" as TR
+  rectangle "MeanPool over set dim (dim=1)" as POOL
+  rectangle "fc2 : Linear(128 -> P=337)" as FC2
+  card "omega : (B, 337)" as OMEGA
+}
+
+Z --> FC1
+FC1 --> TR
+TR --> POOL
+POOL --> FC2
+FC2 --> OMEGA
+
+' =====================================================================
+' IV target network h_omega(k,t) — weights produced by hypernet
+' =====================================================================
+package "IV Network h_omega  (functional, weights = omega)" #LightPink {
+  rectangle "Split omega -> [w0(B,16,2), b0(B,16),\n                w1(B,16,16), b1(B,16),\n                w2(B,1,16),  b2(B,1)]\nTotal: 32+16 + 256+16 + 16+1 = 337" as SPLIT
+  rectangle "Layer 0:\n  x = bmm(KT, w0^T) + b0   // (B,N,16)\n  x = tanh(x)" as L0
+  rectangle "Layer 1:\n  x = bmm(x,  w1^T) + b1   // (B,N,16)\n  x = tanh(x)" as L1
+  rectangle "Layer 2:\n  x = bmm(x,  w2^T) + b2   // (B,N,1)\n  sigma = softplus(x)" as L2
+  card "sigma_pred : (B,N,1)" as SIGMA
+}
+
+OMEGA --> SPLIT
+KT --> L0
+SPLIT --> L0
+L0 --> L1
+L1 --> L2
+L2 --> SIGMA
+
+' =====================================================================
+' Auxiliary no-arb losses
+' =====================================================================
+package "Aux Loss (arbitrage-free)" #LightGreen {
+  rectangle "Calendar:\n  L_cal = mean( ReLU( -(sigma + 2 t * d_sigma/dt) ) )" as CAL
+  rectangle "Butterfly (g-function):\n  g = (1 - k * s_k / s)^2 - (0.5 t s s_k)^2 + t s s_kk\n  L_g = mean( ReLU(-g) )" as G
+  rectangle "Density integral:\n  d_ = (-k - 0.5 s^2 t) / (s sqrt(t))\n  p  = g * exp(-0.5 d_^2) / (s sqrt(2 pi t))\n  L_int = mean( (trapz_k p - 1)^2 )" as INT
+}
+
+SIGMA ..> CAL : "autograd s_t, s_k, s_kk\nover (k_num=71)x(t_num=17) grid\nk in [-1.5, 0.5], t in [0.01, 2.0]"
+SIGMA ..> G
+SIGMA ..> INT
+
+' =====================================================================
+' Training
+' =====================================================================
+package "Training" #Wheat {
+  rectangle "L_data = MSE(sigma_pred, sigma_true)" as DATA
+  rectangle "Total = L_data + L_cal + L_g + L_int" as TOTAL
+  rectangle "Optimizer: Adam(lr=1e-3)\nLR sched: CosineAnnealingLR(T_max=500, eta_min=1e-5)\nEpochs: 500   Batch: 128\nN_contracts (target): 1024 sampled per day\nNaN-safe grad: nan_to_num before step\nBest val MAE checkpoint" as OPT
+}
+
+SIGMA --> DATA
+DATA --> TOTAL
+CAL  --> TOTAL
+G    --> TOTAL
+INT  --> TOTAL
+TOTAL --> OPT
+OPT ..> FC1 : "param updates"
+OPT ..> TR
+OPT ..> FC2
+
+note bottom
+  Train/Val/Test (chronological):
+    Train 2013-01-02..2017-12-31, Val 2018, Test 2019
+  At inference: extract omega_t = g_theta(Z_t) per date once;
+    evaluate any (k,t) via forward_from_weights(omega_t).
+  IV-net activations: Tanh, Tanh, Softplus.
+end note
+
+@enduml

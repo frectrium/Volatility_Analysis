@@ -1,0 +1,96 @@
+@startuml pipeline_A_isnn
+title Pipeline A — ISNN-2 (Per-Date Option Surface Fit)\nJadoon et al. (2025), arXiv:2503.00268
+
+skinparam defaultFontName Monospaced
+skinparam defaultFontSize 11
+skinparam roundCorner 10
+
+' =====================================================================
+' Inputs
+' =====================================================================
+package "Inputs (per date)" #LightYellow {
+  card "x0  : (B,1)\nnormalized strike K/F" as X0
+  card "t0  : (B,1)\nnormalized time T/365" as T0
+}
+
+note right of X0
+  K_norm  = strike / fwd_price
+  T_norm  = maturity_days / 365
+  C_norm  = moussa_price / (disc * fwd)
+  All ops per (date, contract) row.
+end note
+
+' =====================================================================
+' Monotonic time branch (Eq. 8)
+' =====================================================================
+package "Monotonic Branch (time)" #LightCyan {
+  rectangle "NonNegLinear(1 -> H)\nW^{tt}_0 >= 0,  bias\nact: Softplus(beta=1)" as TM0
+  rectangle "NonNegLinear(H -> H)\nW^{tt}_h >= 0\nact: Softplus(beta=1)\n(repeat num_layers-2 times)" as TMh
+  card "t_h  : (B,H)" as TH
+}
+
+T0 --> TM0
+TM0 --> TMh : t_1
+TMh --> TH
+
+' =====================================================================
+' Convex strike branch (Eqs. 9-10)
+' =====================================================================
+package "Convex Branch (strike)" #LightPink {
+  rectangle "Linear(1 -> H)        // W^{xx0}: any sign\n+\nNonNegLinear(1 -> H)  // W^{xt0} >= 0\nadd biases  ->  Softplus(beta=1)" as CX0
+  rectangle "Layer h (1..H-2):\n  term_xx  = NonNegLinear(H->H)(z_h)        // W^{xx} >= 0\n  term_xx0 = Linear(1->H)(x0)               // skip, any sign\n  term_xt  = NonNegLinear(H->H)(t_states[h]) // W^{xt} >= 0\n  z_{h+1}  = Softplus(term_xx + term_xx0 + term_xt)" as CXh
+  card "z_h  : (B,H)" as ZH
+}
+
+X0 --> CX0
+T0 --> CX0 : "via W^{xt0}"
+CX0 --> CXh
+TH ..> CXh : "t_states[h] injection"
+X0 ..> CXh : "x0 skip"
+CXh --> ZH
+
+' =====================================================================
+' Output
+' =====================================================================
+package "Output (Remark 1: NO activation)" #LightGreen {
+  rectangle "NonNegLinear(H -> 1, bias=False)\nW^{out} >= 0" as OUT
+  card "C_norm_pred : (B,1)" as YHAT
+}
+
+ZH --> OUT
+OUT --> YHAT
+
+' =====================================================================
+' Loss / Optimizer
+' =====================================================================
+package "Training" #Wheat {
+  rectangle "Loss = MSE(C_norm_pred, C_norm_true)" as LOSS
+  rectangle "Optimizer: Adam(lr=0.005)\nGrad clip: max_norm=1.0\nScheduler: ReduceLROnPlateau\n  patience=200, factor=0.5, min_lr=1e-6\nEpochs: 2000\nProjection: clamp(W>=1e-6) on every\n  NonNegativeLinear after step\nBest-state checkpoint by min loss" as OPT
+}
+
+YHAT --> LOSS
+LOSS --> OPT
+OPT ..> TM0 : "param updates +\nweight projection"
+OPT ..> CX0
+OPT ..> OUT
+
+' =====================================================================
+' Hyperparameters / shapes block
+' =====================================================================
+note bottom
+  Defaults (fit_surface_for_date):
+    hidden_dim H = 128
+    num_layers   = 3   (=> 1 t-layer, 1 hidden x-layer beyond input)
+    epochs       = 2000
+    lr           = 5e-3
+    batch        = full batch (one date at a time)
+  Activations:
+    sigma_mc = sigma_m = Softplus(beta=1)  =  log(1+exp(x))
+  Constraint validation (post-train, autograd):
+    dC/dT >= -eps   (calendar)   d^2C/dK^2 >= -eps  (butterfly)
+  Stage 4 (downstream, separate file):
+    Evaluate C_norm on grid (12 moneyness x 11 maturities = 132 pts)
+    Invert via brentq -> implied vol matrix.
+end note
+
+@enduml

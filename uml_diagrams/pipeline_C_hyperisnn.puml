@@ -1,0 +1,127 @@
+@startuml pipeline_C_hyperisnn
+title Pipeline C — HyperISNN v3\nTransformer Hypernet -> Residual Modulation -> Vectorised ISNN-2
+
+skinparam defaultFontName Monospaced
+skinparam defaultFontSize 10
+skinparam roundCorner 10
+
+' =====================================================================
+' Inputs
+' =====================================================================
+package "Inputs (per episode/day)" #LightYellow {
+  card "q : (B, N_ref<=18, 3)\nref contracts (logm, T, C_norm)" as Q
+  card "mask : (B, N_ref) bool" as MASK
+  card "ctx : (B, 9)\n(fwd_curve/S - 1)*10 (8 tenors)\n+ r*10" as CTX
+  card "Targets:\n m : (B, M, 1)\n T : (B, M, 1)\n r : (B, M, 1)\n C : (B, M, 1)\n vega : (B, M, 1)" as TGT
+}
+
+' =====================================================================
+' HyperNet g_theta(Z) -> omega in R^P
+' =====================================================================
+package "HyperNet  g_theta" #LightCyan {
+  rectangle "q_enc : Linear(3 -> d=128)" as QENC
+  rectangle "TransformerEncoder x n_layers=3\n  d_model=128, nhead=4,\n  dim_feedforward=4d=512,\n  dropout=0, activation=GELU,\n  norm_first=True (pre-LN), batch_first" as TR
+  rectangle "Mask-aware MeanPool\n  pooled = sum(z*mask)/sum(mask)" as POOL
+  rectangle "LayerNorm(d)" as PN
+  rectangle "c_enc : Linear(9 -> d)\nLayerNorm(d)" as CENC
+  rectangle "concat( pooled, c )  -> (B, 2d)" as CAT
+  rectangle "head: Linear(2d -> 256) -> GELU -> Linear(256 -> P)\nfinal Linear init: N(0, std=0.1), bias=0" as HEAD
+  card "omega : (B, P=spec.total)" as OMEGA
+}
+
+Q    --> QENC
+MASK ..> TR : "src_key_padding_mask = ~mask"
+QENC --> TR
+TR --> POOL
+POOL --> PN
+CTX --> CENC
+PN  --> CAT
+CENC --> CAT
+CAT --> HEAD
+HEAD --> OMEGA
+
+' =====================================================================
+' Residual weight generation
+' =====================================================================
+package "Residual Modulation" #LightPink {
+  rectangle "W_base : learnable (P,)\n  init via softplus^{-1}(target)\n  target_input=1.0,\n  target_hidden=1/H,\n  target_output=0.5,\n  bias init = 0" as WBASE
+  rectangle "alpha : learnable (P,), init=0.1\n(frozen during warm-up)" as ALPHA
+  rectangle "W_raw = W_base + alpha (*) omega\n  (B, P)\n(omega zeroed when warm-up active)" as WRAW
+  rectangle "Per positive entry name:\n  W = softplus(W_raw) + 1e-6\nElse:  W = W_raw\nbout: scalar Parameter, init=-10.0" as WPROC
+}
+
+OMEGA --> WRAW
+WBASE --> WRAW
+ALPHA --> WRAW
+WRAW --> WPROC
+
+' =====================================================================
+' Vectorised ISNN-2 forward
+' =====================================================================
+package "ISNN-2 forward (vectorised over B episodes)" #LightGreen {
+  card "y0 = (1 - m) * scale_m=3.0\nt0 = T  * scale_t=2.0\nx0 = y0" as INPUTS
+
+  rectangle "y-branch  (Wyy>=0, Softplus)\n  y_{h+1} = softplus(bmm(y_h, Wyy_h^T) + by_h)\n  h = 0..L-2" as YBR
+  rectangle "t-branch  (Wtt>=0, Sigmoid)\n  t_{h+1} = sigmoid(bmm(t_h, Wtt_h^T) + bt_h)\n  h = 0..L-2" as TBR
+  rectangle "x-branch layer 0:\n  x_1 = softplus( bmm(x0,Wxx_0^T)\n               + bmm(y0,Wxy_0^T)   // Wxy>=0\n               + bmm(t0,Wxt_0^T)   // Wxt>=0\n               + bx_0 )\n(Wxx_0 also constrained >=0 for monotone in m)" as XL0
+  rectangle "x-branch hidden h=1..L-2:\n  pre = bmm(x_h, Wxx_h^T)        // >=0\n      + bmm(x0,  Wxx0_h^T)       // >=0 skip\n      + bmm(y_h, Wxy_h^T)        // >=0\n      + bmm(t_h, Wxt_h^T)        // >=0\n      + bx_h\n  x_{h+1} = softplus(pre)" as XH
+  rectangle "x-branch output h=L-1 (linear, no activation):\n  pre = sum of bmm terms (same form, dim->1)\n  x_L = pre" as XOUT
+  rectangle "Final head:\n  pre_out = bmm(x_L, Wout^T) + bout    // Wout>=0\n  net     = softplus(pre_out)\n  intrinsic = ReLU(1 - m)\n  C/S = net + intrinsic   // hard arb-free lower bound" as HEAD2
+  card "C_pred : (B, M, 1)" as PRED
+}
+
+WPROC --> YBR
+WPROC --> TBR
+WPROC --> XL0
+WPROC --> XH
+WPROC --> XOUT
+WPROC --> HEAD2
+
+INPUTS --> YBR
+INPUTS --> TBR
+INPUTS --> XL0
+YBR --> XH : "y_h"
+TBR --> XH : "t_h"
+XL0 --> XH
+XH  --> XOUT
+INPUTS --> XOUT : "x0, y_{L-1}, t_{L-1} skip"
+XOUT --> HEAD2
+HEAD2 --> PRED
+
+' =====================================================================
+' Loss + Optimizer
+' =====================================================================
+package "Loss (build_loss registry)" #Wheat {
+  rectangle "Data losses (one chosen):\n  mse | vega-weighted MSE | huber(delta=0.005) |\n  log-price MSE | hybrid (0.5 huber + 0.5 vega)" as LDATA
+  rectangle "upper-bound penalty:\n  L_upp = mean( ReLU(C_pred - 1)^2 )\nvariance-collapse:\n  L_var = mean( ReLU( log(var_true / var_pred) ) )" as LREG
+  rectangle "L = L_data + lambda_upper * L_upp + lambda_var * L_var\n     lambda_upper=1.0, lambda_var=0.01" as LTOT
+}
+
+PRED --> LDATA
+PRED --> LREG
+TGT  --> LDATA
+TGT  --> LREG
+LDATA --> LTOT
+LREG  --> LTOT
+
+package "Optimizer" #Wheat {
+  rectangle "AdamW(lr=3e-4, weight_decay=1e-4)\nGrad clip: 1.0\nSched: CosineAnnealingWarmRestarts(T_0=1000, T_mult=2, eta_min=1e-5)\nSteps: 10000   Batch: 32\nWarm-up: first 500 steps train ONLY W_base + bout\n  (alpha frozen at init, hyper params requires_grad=False)" as OPT
+}
+
+LTOT --> OPT
+OPT ..> QENC : "param updates\n(post warm-up)"
+OPT ..> WBASE
+OPT ..> ALPHA
+
+note bottom
+  Defaults (config.py):
+    ISNN: H=8, L=3        scale_m=3.0  scale_t=2.0
+    Hyper: d=128, heads=4, layers=3, head_hidden=256
+    Episodic sampling per day:
+      n_ctx ~ U[8, min(18, n_q)],   n_tgt = min(80, rest)
+    Positivity (softplus + 1e-6) on:
+      Wyy_*, Wtt_*, Wxy_*, Wxt_*, Wxx_*, Wxx0_h (h>=1), Wout
+    Hard arb-free lower bound C/S >= max(0, 1-m) baked in head.
+end note
+
+@enduml
